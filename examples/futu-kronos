@@ -1,0 +1,86 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+from futu import OpenQuoteContext
+from model import Kronos, KronosTokenizer, KronosPredictor
+
+def get_tencent_kline(lookback, pred_len, ktype='K_5M'):
+    quote_ctx = OpenQuoteContext(host='127.0.0.1', port=11111)
+    total_len = lookback + pred_len
+    ret, data = quote_ctx.get_history_kline(
+        'HK.00700', ktype=ktype, max_count=total_len+10
+    )
+    quote_ctx.close()
+    if ret != 0:
+        raise RuntimeError(f"futu-API error: {data}")
+    df = data[['time_key','open','high','low','close','volume','turnover']]
+    df.rename(columns={
+        'time_key': 'timestamps',
+        'turnover': 'amount'
+    }, inplace=True)
+    df['timestamps'] = pd.to_datetime(df['timestamps'])
+    return df.iloc[-total_len:]
+
+def plot_prediction(kline_df, pred_df):
+    pred_df.index = kline_df.index[-pred_df.shape[0]:]
+    sr_close = kline_df['close']
+    sr_pred_close = pred_df['close']
+    sr_close.name = 'Ground Truth'
+    sr_pred_close.name = "Prediction"
+
+    sr_volume = kline_df['volume']
+    sr_pred_volume = pred_df['volume']
+    sr_volume.name = 'Ground Truth'
+    sr_pred_volume.name = "Prediction"
+
+    close_df = pd.concat([sr_close, sr_pred_close], axis=1)
+    volume_df = pd.concat([sr_volume, sr_pred_volume], axis=1)
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+
+    ax1.plot(close_df['Ground Truth'], label='Ground Truth', color='blue', linewidth=1.5)
+    ax1.plot(close_df['Prediction'], label='Prediction', color='red', linewidth=1.5)
+    ax1.set_ylabel('Close Price', fontsize=14)
+    ax1.legend(loc='lower left', fontsize=12)
+    ax1.grid(True)
+
+    ax2.plot(volume_df['Ground Truth'], label='Ground Truth', color='blue', linewidth=1.5)
+    ax2.plot(volume_df['Prediction'], label='Prediction', color='red', linewidth=1.5)
+    ax2.set_ylabel('Volume', fontsize=14)
+    ax2.legend(loc='upper left', fontsize=12)
+    ax2.grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
+if __name__ == "__main__":
+    # 1. 加载模型和分词器
+    tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
+    model = Kronos.from_pretrained("NeoQuasar/Kronos-small")
+    predictor = KronosPredictor(model, tokenizer, device="cuda:0", max_context=512)
+
+    # 2. 数据采集与准备
+    lookback = 400
+    pred_len = 6  # 只预测下6个周期
+    df = get_tencent_kline(lookback, pred_len, ktype='K_5M')
+
+    x_df = df.loc[:lookback-1, ['open', 'high', 'low', 'close', 'volume', 'amount']]
+    x_timestamp = df.loc[:lookback-1, 'timestamps']
+    y_timestamp = df.loc[lookback:lookback+pred_len-1, 'timestamps']
+
+    # 3. 预测
+    pred_df = predictor.predict(
+        df=x_df,
+        x_timestamp=x_timestamp,
+        y_timestamp=y_timestamp,
+        pred_len=pred_len,
+        T=1.0,
+        top_p=0.9,
+        sample_count=1,
+        verbose=True
+    )
+    print("Forecasted Data Head:")
+    print(pred_df.head())
+
+    # 4. 可视化
+    kline_df = df.loc[:lookback+pred_len-1]
+    plot_prediction(kline_df, pred_df)
